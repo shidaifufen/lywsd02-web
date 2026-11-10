@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>温湿度计 · 网页版</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e8ebf2;--sub:#9aa3b2;--accent:#5b8cff;--ok:#3ecf8e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{max-width:920px;margin:0 auto;padding:40px 20px 8px}
+  h1{margin:0 0 6px;font-size:26px}
+  .sub{color:var(--sub);font-size:14px}
+  main{max-width:920px;margin:0 auto;padding:16px 20px 60px;display:grid;gap:18px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
+  .big{display:flex;gap:34px;align-items:baseline;margin:6px 0 4px}
+  .big b{font-size:56px;font-weight:700}
+  .big span{font-size:18px;color:var(--sub)}
+  canvas{width:100%;height:220px;display:block}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:10px 16px;font-weight:600;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+  button:disabled{opacity:.5}
+  #log{font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--sub);white-space:pre-wrap;max-height:180px;overflow:auto;background:#0c0f14;border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td,th{text-align:left;padding:6px 4px;border-bottom:1px solid var(--line);color:var(--sub)}
+  th{color:#cbd2de;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>温湿度计 · 网页版</h1>
+  <p class="sub">浏览器通过 Web Bluetooth 直连 LYWSD02（米家温湿度计），本地读数、校时、存历史。需要 Chrome / Edge。</p>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="big">
+      <div><b id="temp">--</b><span> °C</span></div>
+      <div><b id="hum">--</b><span> %</span></div>
+    </div>
+    <div class="sub" id="state">未连接</div>
+    <div class="row">
+      <button id="connect" onclick="connect()">连接温湿度计</button>
+      <button class="ghost" onclick="syncTime()" id="sync" disabled>校准设备时间</button>
+      <button class="ghost" onclick="exportCsv()">导出 CSV</button>
+      <button class="ghost" onclick="clearAll()">清空历史</button>
+    </div>
+    <div id="log">就绪</div>
+  </section>
+
+  <section class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:baseline">
+      <b>最近 24 小时</b><span class="sub" id="range">--</span>
+    </div>
+    <canvas id="chart"></canvas>
+  </section>
+
+  <section class="panel">
+    <b>最近记录</b>
+    <table id="list"><thead><tr><th>时间</th><th>温度</th><th>湿度</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+
+<script type="module">
+const SVC = 0xebe0ccb0, CH_DATA = 0xebe0ccc1, CH_TIME = 0xebe0ccb7;
+const logEl = document.getElementById('log');
+const log = (m) => {
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  logEl.textContent += `\n[${t}] ${m}`;
+  logEl.scrollTop = logEl.scrollHeight;
+};
+
+let device = null, chData = null, chTime = null, samples = [];
+
+// ── IndexedDB ──
+let db;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('lywsd02', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('samples', { keyPath: 'ts' });
+    r.onsuccess = () => { db = r.result; res(db); };
+    r.onerror = () => rej(r.error);
+  });
+}
+const tx = () => db.transaction('samples', 'readwrite').objectStore('samples');
+function putSample(s) {
+  return new Promise((res) => { const q = tx().put(s); q.onsuccess = () => res(); q.onerror = () => res(); });
+}
+function allSamples() {
+  return new Promise((res) => {
+    const q = tx().getAll();
+    q.onsuccess = () => res(q.result || []);
+  });
+}
+function clearSamples() {
+  return new Promise((res) => { const q = tx().clear(); q.onsuccess = () => res(); });
+}
+
+// ── 图表 ──
+function drawChart() {
+  const cv = document.getElementById('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const c = cv.getContext('2d');
+  c.scale(dpr, dpr);
+  c.clearRect(0, 0, w, h);
+
+  const pts = samples.filter((s) => s.ts > Date.now() / 1000 - 86400);
+  if (!pts.length) { c.fillStyle = '#666'; c.font = '13px sans-serif'; c.fillText('还没有数据', 12, 24); return; }
+
+  const temps = pts.map((p) => p.temp), hums = pts.map((p) => p.hum);
+  const tMin = Math.min(...temps) - 1, tMax = Math.max(...temps) + 1;
+  const x = (i) => 8 + (i / Math.max(1, pts.length - 1)) * (w - 16);
+  const yT = (v) => h - 24 - ((v - tMin) / Math.max(0.5, tMax - tMin)) * (h - 44);
+  const yH = (v) => h - 24 - (v / 100) * (h - 44);
+
+  c.strokeStyle = '#5b8cff'; c.lineWidth = 2; c.beginPath();
+  pts.forEach((p, i) => (i ? c.lineTo(x(i), yT(p.temp)) : c.moveTo(x(i), yT(p.temp))));
+  c.stroke();
+
+  c.strokeStyle = '#3ecf8e'; c.beginPath();
+  pts.forEach((p, i) => (i ? c.lineTo(x(i), yH(p.hum)) : c.moveTo(x(i), yH(p.hum))));
+  c.stroke();
+
+  c.font = '11px sans-serif'; c.fillStyle = '#9aa3b2';
+  c.fillText(`${tMax.toFixed(1)}°C`, 8, 14);
+  c.fillText(`${tMin.toFixed(1)}°C`, 8, h - 6);
+  document.getElementById('range').textContent = `${pts.length} 个点 · 蓝=温度 绿=湿度`;
+}
+
+function renderList() {
+  const tb = document.querySelector('#list tbody');
+  tb.innerHTML = samples.slice(-12).reverse().map((s) => {
+    const d = new Date(s.ts * 1000);
+    return `<tr><td>${d.toLocaleString('zh-CN', { hour12: false })}</td><td>${s.temp.toFixed(1)} °C</td><td>${s.hum} %</td></tr>`;
+  }).join('') || '<tr><td colspan="3">暂无记录</td></tr>';
+}
+
+// ── BLE ──
+function parseReading(dv) {
+  const t = dv.getInt16(0, true) / 100;
+  const h = dv.getUint8(2);
+  return { t: +t.toFixed(2), h };
+}
+
+async function connect() {
+  if (!('bluetooth' in navigator)) { log('❌ 这个浏览器不支持 Web Bluetooth，请用 Chrome / Edge'); return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'LYWSD' }],
+      optionalServices: [SVC],
+    });
+    log(`已选择：${device.name || device.id}`);
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    chData = await svc.getCharacteristic(CH_DATA);
+    chTime = await svc.getCharacteristic(CH_TIME).catch(() => null);
+
+    await chData.startNotifications();
+    chData.addEventListener('characteristicvaluechanged', async (ev) => {
+      const { t, h } = parseReading(ev.target.value);
+      if (!isFinite(t) || h > 100) return;
+      document.getElementById('temp').textContent = t.toFixed(1);
+      document.getElementById('hum').textContent = h;
+      document.getElementById('state').textContent = '已连接 · ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      const last = samples[samples.length - 1];
+      if (!last || Date.now() / 1000 - last.ts > 60) {
+        const s = { ts: Math.round(Date.now() / 1000), temp: t, hum: h };
+        samples.push(s); await putSample(s);
+        drawChart(); renderList();
+      }
+    });
+    document.getElementById('sync').disabled = !chTime;
+    document.getElementById('connect').textContent = '已连接';
+    log('已连接，等待设备推送读数…');
+  } catch (e) {
+    log('❌ ' + (e?.message || e));
+  }
+}
+
+async function syncTime() {
+  if (!chTime) return;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const tz = -new Date().getTimezoneOffset() / 60;
+    const buf = new Uint8Array(5);
+    new DataView(buf.buffer).setUint32(0, now, true);
+    buf[4] = tz & 0xff;
+    await chTime.writeValue(buf);
+    log(`已写入时间：${new Date().toLocaleString('zh-CN', { hour12: false })}（UTC${tz >= 0 ? '+' : ''}${tz}）`);
+  } catch (e) {
+    log('❌ 校时失败：' + (e?.message || e));
+  }
+}
+
+function exportCsv() {
+  if (!samples.length) return;
+  const rows = ['time,temp,hum', ...samples.map((s) => `${new Date(s.ts * 1000).toISOString()},${s.temp},${s.hum}`)];
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'lywsd02.csv'; a.click();
+}
+
+async function clearAll() {
+  samples = []; await clearSamples(); drawChart(); renderList(); log('已清空历史');
+}
+
+window.connect = connect; window.syncTime = syncTime; window.exportCsv = exportCsv; window.clearAll = clearAll;
+
+await openDB();
+samples = await allSamples();
+drawChart(); renderList();
+window.addEventListener('resize', drawChart);
+</script>
+</body>
+</html>
